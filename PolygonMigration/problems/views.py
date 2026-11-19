@@ -84,6 +84,120 @@ def parse_problem_html(html_content):
         'notes': notes,
     }
 
+
+def validate_test_cases(test_cases):
+    """
+    Validates that test_cases is a valid, complete list of test cases from Polygon.
+    Raises ValueError if test_cases is None, not a list, contains invalid items,
+    or has missing/None input/output values.
+    """
+    if test_cases is None:
+        raise ValueError("Failed to fetch test cases: response is None.")
+    if not isinstance(test_cases, list):
+        raise ValueError(f"Invalid test case response: expected list, got {type(test_cases).__name__}.")
+    for idx, tc in enumerate(test_cases):
+        if not isinstance(tc, dict):
+            raise ValueError(f"Invalid test case at index {idx}: expected dict, got {type(tc).__name__}.")
+        if 'input' not in tc or 'output' not in tc:
+            raise ValueError(f"Incomplete test case at index {idx}: missing 'input' or 'output'.")
+        if tc['input'] is None or tc['output'] is None:
+            raise ValueError(f"Incomplete test case at index {idx}: 'input' or 'output' is None.")
+
+
+def sync_problem_test_cases(problem_obj, test_cases):
+    """
+    Synchronizes ProblemTestCase records for problem_obj with the provided test_cases.
+    - Validates test case data before making changes.
+    - Updates existing records in-place (preserving IDs and orders).
+    - Creates new records if collection expanded.
+    - Prunes stale records if collection reduced.
+    - Updates problem_obj.test_case_count.
+    Must be called within a database transaction.
+    """
+    validate_test_cases(test_cases)
+    
+    existing_tcs = list(ProblemTestCase.objects.filter(problem=problem_obj).order_by('order'))
+    active_ids = set()
+    
+    for idx, test in enumerate(test_cases):
+        order = idx + 1
+        input_data = str(test['input'])
+        output_data = str(test['output'])
+        is_sample = bool(test.get('is_sample', False))
+        description = str(test.get('description', '') or '')
+        
+        if idx < len(existing_tcs):
+            ptc = existing_tcs[idx]
+            ptc.input = input_data
+            ptc.output = output_data
+            ptc.is_sample = is_sample
+            ptc.description = description
+            ptc.order = order
+            ptc.save()
+            active_ids.add(ptc.id)
+        else:
+            ptc = ProblemTestCase.objects.create(
+                problem=problem_obj,
+                is_sample=is_sample,
+                input=input_data,
+                output=output_data,
+                description=description,
+                order=order
+            )
+            active_ids.add(ptc.id)
+            
+    # Prune any stale records
+    stale_qs = ProblemTestCase.objects.filter(problem=problem_obj).exclude(id__in=active_ids)
+    deleted_count, _ = stale_qs.delete()
+    if deleted_count > 0:
+        logger.info("Pruned %d stale ProblemTestCase records for problem %s", deleted_count, problem_obj.id)
+        
+    problem_obj.test_case_count = len(test_cases)
+    problem_obj.save(update_fields=['test_case_count'])
+    return len(active_ids), deleted_count
+
+
+def sync_sample_test_cases(problem_obj, test_cases):
+    """
+    Synchronizes SampleTestCase records for problem_obj.
+    Filters sample test cases (where is_sample=True), updates existing sample records in-place,
+    creates new ones, and prunes stale sample test cases.
+    Must be called within a database transaction.
+    """
+    validate_test_cases(test_cases)
+    
+    sample_tests = [test for test in test_cases if test.get('is_sample', False)]
+    existing_samples = list(SampleTestCase.objects.filter(problem=problem_obj).order_by('order'))
+    active_sample_ids = set()
+    
+    for idx, test in enumerate(sample_tests):
+        order = idx + 1
+        input_data = str(test['input'])
+        output_data = str(test['output'])
+        
+        if idx < len(existing_samples):
+            stc = existing_samples[idx]
+            stc.input = input_data
+            stc.output = output_data
+            stc.order = order
+            stc.save()
+            active_sample_ids.add(stc.id)
+        else:
+            stc = SampleTestCase.objects.create(
+                problem=problem_obj,
+                input=input_data,
+                output=output_data,
+                order=order
+            )
+            active_sample_ids.add(stc.id)
+            
+    stale_samples = SampleTestCase.objects.filter(problem=problem_obj).exclude(id__in=active_sample_ids)
+    deleted_count, _ = stale_samples.delete()
+    if deleted_count > 0:
+        logger.info("Pruned %d stale SampleTestCase records for problem %s", deleted_count, problem_obj.id)
+    return len(active_sample_ids), deleted_count
+
+
 @user_passes_test(lambda u: u.is_authenticated and u.is_staff, login_url='/users/login/')
 def index(request):
     """
@@ -183,98 +297,97 @@ def index(request):
                     context['main_solution'] = main_solution
             
             try:
-                with transaction.atomic():
-                    # Handle Azure migration
-                    azure_blob_uploaded = False
-                    azure_blob_problem_id = None
-                    if migrate_to_azure:
-                        logger.info('Azure migration triggered for polygon_id=%s', polygon_id)
-                        problem_obj = Problem.objects.filter(polygon_id=polygon_id).first()
-                        if not problem_obj:
-                            logger.warning('Problem with Polygon ID %s not in DB', polygon_id)
-                            context['error'] = f"Problem with Polygon ID {polygon_id} has not been migrated to the database yet. Please migrate the problem to the database first before migrating test cases to Azure."
-                            return render(request, 'problems/index.html', context)
-                        
-                        # Problem exists in database, proceed with Azure migration
-                        logger.info('Problem found in DB, proceeding with Azure migration')
-                        AZURE_STORAGE_ACCOUNT_URL = settings.AZURE_STORAGE_ACCOUNT_URL
-                        AZURE_TENANT_ID = settings.AZURE_TENANT_ID
-                        AZURE_CLIENT_ID = settings.AZURE_CLIENT_ID
-                        AZURE_USERNAME = settings.AZURE_USERNAME
-                        AZURE_PASSWORD = settings.AZURE_PASSWORD
-                        AZURE_CONTAINER_NAME = settings.AZURE_CONTAINER_NAME
-                        
-                        # Use the database problem ID for Azure blob naming
-                        problem_id = problem_obj.id if problem_obj else None
-                        logger.info('Azure migration params: problem_id=%s, container=%s', problem_id, AZURE_CONTAINER_NAME)
-                        
-                        # Remove Redis cache for this problem id before Azure migration
-                        if problem_obj:
-                            api.delete_problem_test_case_cache(problem_id)
-                        
-                        # Check for custom checker before migration
-                        custom_checker_info = api.get_custom_checker_info(polygon_id)
-                        if custom_checker_info:
-                            logger.info('Custom checker detected before Azure migration: %s', custom_checker_info)
-                            context['info'] = f"Custom checker '{custom_checker_info['name']}' detected. Will be compiled and uploaded to Azure."
-                        
-                        logger.info('Calling migrate_to_azure_blob')
-                        try:
-                            api.migrate_to_azure_blob(
-                                polygon_id,
-                                AZURE_STORAGE_ACCOUNT_URL,
-                                AZURE_TENANT_ID,
-                                AZURE_CLIENT_ID,
-                                AZURE_USERNAME,
-                                AZURE_PASSWORD,
-                                AZURE_CONTAINER_NAME,
-                                problem_id
-                            )
-                            azure_blob_uploaded = True
-                            azure_blob_problem_id = problem_id
-                        except Exception as e:
-                            logger.error('Azure migration failed: %s', e, exc_info=True)
-                            # Compensate: attempt to delete any uploaded blobs if possible (pseudo-code, implement as needed)
-                            # api.delete_azure_blob(problem_id)
-                            context['error'] = f"Azure migration failed: {str(e)}"
-                            raise
-                        logger.info('Azure migration completed successfully')
-                        
-                        success_message = "Test cases migrated to Azure Blob Storage successfully."
-                        if custom_checker_info:
-                            success_message += f" Custom checker '{custom_checker_info['name']}' was also compiled and uploaded."
-                        context['success'] = success_message
+                # Handle Azure migration
+                azure_blob_uploaded = False
+                azure_blob_problem_id = None
+                if migrate_to_azure:
+                    logger.info('Azure migration triggered for polygon_id=%s', polygon_id)
+                    problem_obj = Problem.objects.filter(polygon_id=polygon_id).first()
+                    if not problem_obj:
+                        logger.warning('Problem with Polygon ID %s not in DB', polygon_id)
+                        context['error'] = f"Problem with Polygon ID {polygon_id} has not been migrated to the database yet. Please migrate the problem to the database first before migrating test cases to Azure."
+                        return render(request, 'problems/index.html', context)
                     
-                    # Always fetch problem data for display
-                    info = api.get_problem_info(polygon_id)
-                    logger.debug('Polygon problem info: %s', info)
+                    # Problem exists in database, proceed with Azure migration
+                    logger.info('Problem found in DB, proceeding with Azure migration')
+                    AZURE_STORAGE_ACCOUNT_URL = settings.AZURE_STORAGE_ACCOUNT_URL
+                    AZURE_TENANT_ID = settings.AZURE_TENANT_ID
+                    AZURE_CLIENT_ID = settings.AZURE_CLIENT_ID
+                    AZURE_USERNAME = settings.AZURE_USERNAME
+                    AZURE_PASSWORD = settings.AZURE_PASSWORD
+                    AZURE_CONTAINER_NAME = settings.AZURE_CONTAINER_NAME
                     
-                    # Download and extract the problem package, then parse problem.html
-                    problem_html_content = api.download_and_extract_package(polygon_id)
-                    logger.debug('Downloaded and extracted problem_html_content, length: %d', len(problem_html_content))
-                    html_data = parse_problem_html(problem_html_content)
-                    logger.debug('Parsed html_data: %s', html_data)
+                    # Use the database problem ID for Azure blob naming
+                    problem_id = problem_obj.id if problem_obj else None
+                    logger.info('Azure migration params: problem_id=%s, container=%s', problem_id, AZURE_CONTAINER_NAME)
                     
+                    # Remove Redis cache for this problem id before Azure migration
+                    if problem_obj:
+                        api.delete_problem_test_case_cache(problem_id)
+                    
+                    # Check for custom checker before migration
+                    custom_checker_info = api.get_custom_checker_info(polygon_id)
+                    if custom_checker_info:
+                        logger.info('Custom checker detected before Azure migration: %s', custom_checker_info)
+                        context['info'] = f"Custom checker '{custom_checker_info['name']}' detected. Will be compiled and uploaded to Azure."
+                    
+                    logger.info('Calling migrate_to_azure_blob')
+                    try:
+                        api.migrate_to_azure_blob(
+                            polygon_id,
+                            AZURE_STORAGE_ACCOUNT_URL,
+                            AZURE_TENANT_ID,
+                            AZURE_CLIENT_ID,
+                            AZURE_USERNAME,
+                            AZURE_PASSWORD,
+                            AZURE_CONTAINER_NAME,
+                            problem_id
+                        )
+                        azure_blob_uploaded = True
+                        azure_blob_problem_id = problem_id
+                    except Exception as e:
+                        logger.error('Azure migration failed: %s', e, exc_info=True)
+                        # Compensate: attempt to delete any uploaded blobs if possible (pseudo-code, implement as needed)
+                        # api.delete_azure_blob(problem_id)
+                        context['error'] = f"Azure migration failed: {str(e)}"
+                        raise
+                    logger.info('Azure migration completed successfully')
+                    
+                    success_message = "Test cases migrated to Azure Blob Storage successfully."
+                    if custom_checker_info:
+                        success_message += f" Custom checker '{custom_checker_info['name']}' was also compiled and uploaded."
+                    context['success'] = success_message
+                
+                # Always fetch problem data for display
+                info = api.get_problem_info(polygon_id)
+                logger.debug('Polygon problem info: %s', info)
+                
+                # Download and extract the problem package, then parse problem.html
+                problem_html_content = api.download_and_extract_package(polygon_id)
+                logger.debug('Downloaded and extracted problem_html_content, length: %d', len(problem_html_content))
+                html_data = parse_problem_html(problem_html_content)
+                logger.debug('Parsed html_data: %s', html_data)
 
-                    # Fetch all test cases for display
-                    all_test_cases = []
-                    if(migrate_to_db or migrate_test_cases_to_db or migrate_to_azure):
-                        all_test_cases=api.get_test_cases_from_redis(polygon_id)
-                        if all_test_cases is None:
-                            logger.warning('Test cases not found in Redis, fetching from Polygon')
-                            all_test_cases = api.get_all_test_cases(polygon_id)
-                            api.store_test_cases_in_redis(polygon_id, all_test_cases, expiry_hours=0.5)
-                        else:
-                            logger.info('Retrieved test cases from Redis for test case migration to DB (saved Polygon API call)')
-                    else:
+                # Fetch all test cases for display
+                all_test_cases = []
+                if (migrate_to_db or migrate_test_cases_to_db or migrate_to_azure):
+                    all_test_cases = api.get_test_cases_from_redis(polygon_id)
+                    if all_test_cases is None:
+                        logger.warning('Test cases not found in Redis, fetching from Polygon')
                         all_test_cases = api.get_all_test_cases(polygon_id)
-                        logger.debug('Fetched all test cases.')
-                        # Store test cases in Redis for this platform (30 minutes expiry)
+                        if all_test_cases is not None:
+                            api.store_test_cases_in_redis(polygon_id, all_test_cases, expiry_hours=0.5)
+                    else:
+                        logger.info('Retrieved test cases from Redis for test case migration to DB (saved Polygon API call)')
+                else:
+                    all_test_cases = api.get_all_test_cases(polygon_id)
+                    logger.debug('Fetched all test cases.')
+                    if all_test_cases is not None:
                         api.store_test_cases_in_redis(polygon_id, all_test_cases, expiry_hours=0.5)
-                        
-                    
-                    # Prepare test cases for display with truncated content
-                    display_test_cases = []
+
+                # Prepare test cases for display with truncated content
+                display_test_cases = []
+                if all_test_cases and isinstance(all_test_cases, list):
                     for test_case in all_test_cases:
                         input_data = test_case.get('input', '')
                         output_data = test_case.get('output', '')
@@ -290,65 +403,79 @@ def index(request):
                             'full_output': output_data,
                             'full_description': description,
                         })
+                
+                context['all_test_cases'] = display_test_cases
+                
+                # Prepare problem data for display
+                title = html_data['title'] or info.get('name', f'Polygon Problem {polygon_id}')
+                slug = slugify(title)
+                problem_statement = html_data['legend']
+                input_format = html_data['input_format']
+                output_format = html_data['output_format']
+                constraints = ''
+                editorial = ''
+                time_limit = info.get('timeLimit', 1000)
+                memory_limit = info.get('memoryLimit', 256)
+                checker_type = api._make_request('problem.checker', {'problemId': polygon_id}) or 'ncmp'
+                logger.debug('checker_type=%s', checker_type)
+                if checker_type.startswith('std::'):
+                    checker_type = checker_type[5:]
+                if checker_type.endswith('.cpp'):
+                    checker_type = checker_type[:-4]
+                
+                # Check if checker is valid (in CHECKER_TYPE_CHOICES)
+                valid_checkers = ['ncmp', 'fcmp', 'hcmp', 'lcmp', 'nyesno', 'rcmp4', 'rcmp6', 'rcmp9', 'wcmp', 'yesno']
+                if checker_type not in valid_checkers:
+                    checker_type = 'custom'
+                    # context['info'] = f"Custom checker detected. Please reach out to dev team."
+                
+                # Get custom checker info for display
+                custom_checker_info = api.get_custom_checker_info(polygon_id)
+                
+                test_case_count = len(all_test_cases) if all_test_cases is not None else len(api.get_test_cases(polygon_id))
+                logger.debug('test_case_count=%d', test_case_count)
+                
+                # Store fetched data in context for display (without database operations)
+                notes = html_data['notes']
+                context['fetched_problem'] = {
+                    'polygon_id': polygon_id,
+                    'title': title,
+                    'slug': slug,
+                    'difficulty': difficulty,
+                    'problem_statement': problem_statement,
+                    'input_format': input_format,
+                    'output_format': output_format,
+                    'constraints': constraints,
+                    'editorial': editorial,
+                    'time_limit': time_limit,
+                    'memory_limit': memory_limit,
+                    'checker_type': checker_type,
+                    'custom_checker_info': custom_checker_info,
+                    'test_case_count': test_case_count,
+                    'notes': notes,
+                }
+                
+                # Handle database migration
+                if migrate_to_db:
+                    # Validate that difficulty is provided
+                    if not difficulty:
+                        context['error'] = "Please select a difficulty level before migrating to database."
+                        raise Exception(context['error'])
                     
-                    context['all_test_cases'] = display_test_cases
+                    # Fetch and validate test cases outside database transaction
+                    test_cases = api.get_test_cases_from_redis(polygon_id)
+                    if test_cases is None:
+                        logger.warning('Test cases not found in Redis, fetching from Polygon')
+                        test_cases = api.get_all_test_cases(polygon_id)
+                        if test_cases is not None:
+                            api.store_test_cases_in_redis(polygon_id, test_cases, expiry_hours=0.5)
+                    else:
+                        logger.info('Retrieved test cases from Redis for test case migration to DB (saved Polygon API call)')
                     
-                    # Prepare problem data for display
-                    title = html_data['title'] or info.get('name', f'Polygon Problem {polygon_id}')
-                    slug = slugify(title)
-                    problem_statement = html_data['legend']
-                    input_format = html_data['input_format']
-                    output_format = html_data['output_format']
-                    constraints = ''
-                    editorial = ''
-                    time_limit = info.get('timeLimit', 1000)
-                    memory_limit = info.get('memoryLimit', 256)
-                    checker_type = api._make_request('problem.checker', {'problemId': polygon_id}) or 'ncmp'
-                    logger.debug('checker_type=%s', checker_type)
-                    if checker_type.startswith('std::'):
-                        checker_type = checker_type[5:]
-                    if checker_type.endswith('.cpp'):
-                        checker_type = checker_type[:-4]
-                    
-                    # Check if checker is valid (in CHECKER_TYPE_CHOICES)
-                    valid_checkers = ['ncmp', 'fcmp', 'hcmp', 'lcmp', 'nyesno', 'rcmp4', 'rcmp6', 'rcmp9', 'wcmp', 'yesno']
-                    if checker_type not in valid_checkers:
-                        checker_type = 'custom'
-                        # context['info'] = f"Custom checker detected. Please reach out to dev team."
-                    
-                    # Get custom checker info for display
-                    custom_checker_info = api.get_custom_checker_info(polygon_id)
-                    
-                    test_case_count = len(api.get_test_cases(polygon_id))
-                    logger.debug('test_case_count=%d', test_case_count)
-                    
-                    # Store fetched data in context for display (without database operations)
-                    notes = html_data['notes']
-                    context['fetched_problem'] = {
-                        'polygon_id': polygon_id,
-                        'title': title,
-                        'slug': slug,
-                        'difficulty': difficulty,
-                        'problem_statement': problem_statement,
-                        'input_format': input_format,
-                        'output_format': output_format,
-                        'constraints': constraints,
-                        'editorial': editorial,
-                        'time_limit': time_limit,
-                        'memory_limit': memory_limit,
-                        'checker_type': checker_type,
-                        'custom_checker_info': custom_checker_info,
-                        'test_case_count': test_case_count,
-                        'notes': notes,
-                    }
-                    
-                    # Handle database migration
-                    if migrate_to_db:
-                        # Validate that difficulty is provided
-                        if not difficulty:
-                            context['error'] = "Please select a difficulty level before migrating to database."
-                            raise Exception(context['error'])
-                        
+                    logger.debug('test_cases for DB migration.')
+                    validate_test_cases(test_cases)
+
+                    with transaction.atomic():
                         # Try to find an existing Problem by polygon_id or by ProblemTag name matching the title
                         logger.info('Starting DB migration for polygon_id=%s', polygon_id)
                         problem_obj = Problem.objects.filter(Q(polygon_id=polygon_id)).first()
@@ -430,147 +557,90 @@ def index(request):
                                 logger.info('Created new tag from input: %s', new_tag)
                             else:
                                 logger.debug('Added existing tag from input: %s', new_tag)
-                        
-                        # Update context with current tags for display
-                        final_tags = [tag.tag_name for tag in problem_obj.extra_tags.all()]
-                        context['selected_tags'] = final_tags
-                        logger.debug('Final tags after processing: %s', final_tags)
 
-                        # Get test cases from Redis instead of fetching from Polygon again
-                        test_cases = api.get_test_cases_from_redis(polygon_id)
-                        if test_cases is None:
-                            # Fallback to fetching from Polygon if not in Redis
-                            logger.warning('Test cases not found in Redis, fetching from Polygon')
-                            test_cases = api.get_all_test_cases(polygon_id)
-                            # Store them in Redis for future use
-                            api.store_test_cases_in_redis(polygon_id, test_cases, expiry_hours=0.5)
-                        else:
-                            logger.info('Retrieved test cases from Redis for test case migration to DB (saved Polygon API call)')
-                        
-                        logger.debug('test_cases for DB migration.')
+                        # Synchronize sample test cases safely
+                        sync_sample_test_cases(problem_obj, test_cases)
 
-                        # Update or create sample test cases
-                        sample_tests = [test for test in test_cases if test.get('is_sample', False)]
-                        logger.debug('sample_tests: %s', sample_tests)
-                        existing_sample_cases = list(SampleTestCase.objects.filter(problem=problem_obj).order_by('order'))
-                        order = 1
-                        for idx, test in enumerate(sample_tests):
-                            input_data = test.get('input')
-                            output_data = test.get('output')
-                            logger.debug('Sample test idx=%d, input_data length=%s, output_data length=%s', idx, len(str(input_data)) if input_data is not None else 'None', len(str(output_data)) if output_data is not None else 'None')
-                            if input_data is not None and output_data is not None:
-                                input_data = str(input_data)
-                                output_data = str(output_data)
-                                if idx < len(existing_sample_cases):
-                                    # Update existing sample test case
-                                    stc = existing_sample_cases[idx]
-                                    stc.input = input_data
-                                    stc.output = output_data
-                                    stc.order = order
-                                    stc.save()
-                                else:
-                                    # Create new sample test case
-                                    SampleTestCase.objects.create(
-                                        problem=problem_obj,
-                                        input=input_data,
-                                        output=output_data,
-                                        order=order
-                                    )
-                                order += 1
+                    # Update context with current tags for display
+                    final_tags = [tag.tag_name for tag in problem_obj.extra_tags.all()]
+                    context['selected_tags'] = final_tags
+                    logger.debug('Final tags after processing: %s', final_tags)
 
-                        # Fetch the Problem entry from the database to display
-                        db_problem = Problem.objects.get(pk=problem_obj.pk)
-                        context['db_problem'] = db_problem
+                    # Fetch the Problem entry from the database to display
+                    db_problem = Problem.objects.get(pk=problem_obj.pk)
+                    context['db_problem'] = db_problem
 
-                        # Fetch main correct solution from Polygon if possible
+                    # Fetch main correct solution from Polygon if possible
+                    main_solution = None
+                    try:
+                        # Get solutions using Polygon API
+                        solutions = api._make_request('problem.solutions', {'problemId': polygon_id})
+                        logger.debug('Fetched solutions: %s', solutions)
+                        if solutions:
+                            # Look for main solution (tag 'MA') first, then any other solution
+                            main_solution_name = None
+                            for solution in solutions:
+                                if solution.get('tag') == 'MA':  # Main solution
+                                    main_solution_name = solution['name']
+                                    break
+                            if not main_solution_name and solutions:
+                                # If no main solution found, use the first available solution
+                                main_solution_name = solutions[0]['name']
+                            
+                            if main_solution_name:
+                                # Get the solution content
+                                main_solution = api._make_plain_request('problem.viewSolution', {
+                                    'problemId': polygon_id,
+                                    'name': main_solution_name
+                                })
+                    except Exception as e:
+                        logger.error('Error fetching solution: %s', e)
                         main_solution = None
-                        try:
-                            # Get solutions using Polygon API
-                            solutions = api._make_request('problem.solutions', {'problemId': polygon_id})
-                            logger.debug('Fetched solutions: %s', solutions)
-                            if solutions:
-                                # Look for main solution (tag 'MA') first, then any other solution
-                                main_solution_name = None
-                                for solution in solutions:
-                                    if solution.get('tag') == 'MA':  # Main solution
-                                        main_solution_name = solution['name']
-                                        break
-                                if not main_solution_name and solutions:
-                                    # If no main solution found, use the first available solution
-                                    main_solution_name = solutions[0]['name']
-                                
-                                if main_solution_name:
-                                    # Get the solution content
-                                    main_solution = api._make_plain_request('problem.viewSolution', {
-                                        'problemId': polygon_id,
-                                        'name': main_solution_name
-                                    })
-                        except Exception as e:
-                            logger.error('Error fetching solution: %s', e)
-                            main_solution = None
-                        context['main_solution'] = main_solution
+                    context['main_solution'] = main_solution
 
-                    if migrate_test_cases_to_db:
-                        problem_obj = Problem.objects.filter(polygon_id=polygon_id).first()
-                        if not problem_obj:
-                            logger.warning('Problem not found in DB for test case migration')
-                            context['error'] = "Please migrate the problem to the database first."
-                            raise Exception(context['error'])
-                        
-                        # Get test cases from Redis instead of fetching from Polygon again
-                        test_cases = api.get_test_cases_from_redis(polygon_id)
-                        if test_cases is None:
-                            # Fallback to fetching from Polygon if not in Redis
-                            logger.warning('Test cases not found in Redis, fetching from Polygon')
-                            test_cases = api.get_all_test_cases(polygon_id)
-                            # Store them in Redis for future use
+                if migrate_test_cases_to_db:
+                    problem_obj = Problem.objects.filter(polygon_id=polygon_id).first()
+                    if not problem_obj:
+                        logger.warning('Problem not found in DB for test case migration')
+                        context['error'] = "Please migrate the problem to the database first."
+                        raise Exception(context['error'])
+                    
+                    # Get test cases from Redis instead of fetching from Polygon again (outside transaction)
+                    test_cases = api.get_test_cases_from_redis(polygon_id)
+                    if test_cases is None:
+                        # Fallback to fetching from Polygon if not in Redis
+                        logger.warning('Test cases not found in Redis, fetching from Polygon')
+                        test_cases = api.get_all_test_cases(polygon_id)
+                        # Store them in Redis for future use
+                        if test_cases is not None:
                             api.store_test_cases_in_redis(polygon_id, test_cases, expiry_hours=0.5)
-                        else:
-                            logger.info('Retrieved test cases from Redis for test case migration to DB (saved Polygon API call)')
-                        
-                        logger.debug('test_cases for DB migration.')
-                        existing_test_cases = list(ProblemTestCase.objects.filter(problem=problem_obj).order_by('order'))
-                        order = 1
-                        for idx, test in enumerate(test_cases):
-                            input_data = test.get('input')
-                            output_data = test.get('output')
-                            is_sample = test.get('is_sample', False)
-                            description = test.get('description', '') if 'description' in test else ''
-                            logger.debug('Test case idx=%d, input_data length=%s, output_data length=%s, is_sample=%s, description=%s', idx, len(str(input_data)) if input_data is not None else 'None', len(str(output_data)) if output_data is not None else 'None', is_sample, description)
-                            if input_data is not None and output_data is not None:
-                                input_data = str(input_data)
-                                output_data = str(output_data)
-                                if idx < len(existing_test_cases):
-                                    # Update existing test case
-                                    ptc = existing_test_cases[idx]
-                                    ptc.input = input_data
-                                    ptc.output = output_data
-                                    ptc.is_sample = is_sample
-                                    ptc.description = description
-                                    ptc.order = order
-                                    ptc.save()
-                                else:
-                                    # Create new test case
-                                    ProblemTestCase.objects.create(
-                                        problem=problem_obj,
-                                        is_sample=is_sample,
-                                        input=input_data,
-                                        output=output_data,
-                                        description=description,
-                                        order=order
-                                    )
-                                order += 1
-                        success_message = "Test cases description migrated to database Successfully."
-                        context['success'] = success_message
+                    else:
+                        logger.info('Retrieved test cases from Redis for test case migration to DB (saved Polygon API call)')
+                    
+                    logger.debug('test_cases for DB migration.')
+                    # Validate test cases collection BEFORE opening database transaction
+                    validate_test_cases(test_cases)
+                    
+                    # Atomic database synchronization
+                    with transaction.atomic():
+                        synced_count, pruned_count = sync_problem_test_cases(problem_obj, test_cases)
+                        sync_sample_test_cases(problem_obj, test_cases)
+                    
+                    success_message = f"Test cases migrated to database successfully ({synced_count} active"
+                    if pruned_count > 0:
+                        success_message += f", {pruned_count} stale removed"
+                    success_message += ")."
+                    context['success'] = success_message
 
             except Exception as e:
                 logger.error('Exception in index view: %s', e, exc_info=True)
                 context['error'] = f"Migration failed and all changes have been rolled back. Reason: {str(e)}"
                 # Compensate for Azure: attempt to delete any uploaded blobs if azure_blob_uploaded is True (pseudo-code)
-                if azure_blob_uploaded and azure_blob_problem_id:
+                if azure_blob_uploaded and azure_blob_problem_id and hasattr(api, 'delete_azure_blob'):
                     api.delete_azure_blob(azure_blob_problem_id)
                 # Compensate for Redis: clear any cached test cases if needed
-                api.clear_test_cases_from_redis(polygon_id)
+                if hasattr(api, 'clear_test_cases_from_redis'):
+                    api.clear_test_cases_from_redis(polygon_id)
 
     # Update selected_tags_json after all context updates
     if 'selected_tags' in context:

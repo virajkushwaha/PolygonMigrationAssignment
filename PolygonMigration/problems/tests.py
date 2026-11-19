@@ -161,3 +161,237 @@ class TestCaseDataIntegrityTests(TestCase):
         self.assertEqual(tcs[2].output, '300\n')
 
 
+class TestCaseSynchronizationTests(TestCase):
+    def setUp(self):
+        self.client = Client()
+        self.staff_user = User.objects.create_superuser(
+            email='sync_tester@polygon.com',
+            password='testpassword123',
+            first_name='Sync',
+            last_name='Tester',
+            username='sync_tester',
+            contact_number='1234567890',
+            college='Test College',
+            graduation_year=2024,
+            gender='OTHER',
+        )
+        self.client.force_login(self.staff_user)
+        self.problem = Problem.objects.create(
+            polygon_id='77777',
+            title='Sync Problem',
+            slug='sync-problem',
+            difficulty='easy'
+        )
+
+    def _post_sync(self, test_cases_data, api_error=None):
+        with patch('problems.views.PolygonAPI') as mock_api_class:
+            mock_api = mock_api_class.return_value
+            if api_error:
+                mock_api.get_test_cases_from_redis.return_value = None
+                mock_api.get_all_test_cases.side_effect = api_error
+            else:
+                mock_api.get_test_cases_from_redis.return_value = test_cases_data
+                mock_api.get_all_test_cases.return_value = test_cases_data
+            
+            mock_api.get_problem_info.return_value = {'name': 'Sync Problem'}
+            mock_api.download_and_extract_package.return_value = (
+                '<html><div class="title">Sync Problem</div>'
+                '<div class="legend">Legend</div>'
+                '<div class="input-specification">Input</div>'
+                '<div class="output-specification">Output</div></html>'
+            )
+            mock_api._make_request.return_value = 'ncmp'
+            mock_api.get_custom_checker_info.return_value = None
+
+            response = self.client.post('/', {
+                'problem_id': '77777',
+                'migrate_test_cases_to_db': '1'
+            })
+            return response
+
+    def test_initial_migration_of_20_test_cases(self):
+        """Scenario A: Initial migration of 20 test cases creates exactly 20 records."""
+        test_cases = [
+            {'index': i, 'input': f'in_{i}\n', 'output': f'out_{i}\n', 'is_sample': (i == 1), 'description': f'TC {i}'}
+            for i in range(1, 21)
+        ]
+        self.assertEqual(ProblemTestCase.objects.filter(problem=self.problem).count(), 0)
+        
+        response = self._post_sync(test_cases)
+        
+        self.assertEqual(ProblemTestCase.objects.filter(problem=self.problem).count(), 20)
+        self.problem.refresh_from_db()
+        self.assertEqual(self.problem.test_case_count, 20)
+        
+        orders = list(ProblemTestCase.objects.filter(problem=self.problem).order_by('order').values_list('order', flat=True))
+        self.assertEqual(orders, list(range(1, 21)))
+
+    def test_remigration_after_reducing_collection_from_20_to_12(self):
+        """Scenario B: Re-migration after reducing collection from 20 to 12 prunes the 8 stale records."""
+        initial_20 = [
+            {'index': i, 'input': f'in_{i}\n', 'output': f'out_{i}\n', 'is_sample': (i == 1), 'description': f'TC {i}'}
+            for i in range(1, 21)
+        ]
+        self._post_sync(initial_20)
+        self.assertEqual(ProblemTestCase.objects.filter(problem=self.problem).count(), 20)
+        
+        # Now Polygon has only 12 test cases
+        reduced_12 = [
+            {'index': i, 'input': f'in_updated_{i}\n', 'output': f'out_updated_{i}\n', 'is_sample': (i == 1), 'description': f'Updated TC {i}'}
+            for i in range(1, 13)
+        ]
+        self._post_sync(reduced_12)
+        
+        # Exactly 12 must remain
+        self.assertEqual(ProblemTestCase.objects.filter(problem=self.problem).count(), 12)
+        self.problem.refresh_from_db()
+        self.assertEqual(self.problem.test_case_count, 12)
+        
+        tcs = list(ProblemTestCase.objects.filter(problem=self.problem).order_by('order'))
+        self.assertEqual(len(tcs), 12)
+        self.assertEqual(tcs[0].input, 'in_updated_1\n')
+        self.assertEqual(tcs[11].input, 'in_updated_12\n')
+        self.assertEqual([tc.order for tc in tcs], list(range(1, 13)))
+
+    def test_no_duplicate_records_on_repeated_migration(self):
+        """Scenario C: Repeated migration with same collection does not create duplicates."""
+        test_cases = [
+            {'index': i, 'input': f'in_{i}\n', 'output': f'out_{i}\n', 'is_sample': False}
+            for i in range(1, 13)
+        ]
+        self._post_sync(test_cases)
+        self.assertEqual(ProblemTestCase.objects.filter(problem=self.problem).count(), 12)
+        
+        # Run second time
+        self._post_sync(test_cases)
+        self.assertEqual(ProblemTestCase.objects.filter(problem=self.problem).count(), 12)
+        
+        # Run third time
+        self._post_sync(test_cases)
+        self.assertEqual(ProblemTestCase.objects.filter(problem=self.problem).count(), 12)
+
+    def test_updating_existing_test_case_content(self):
+        """Scenario D: Updating content of existing test cases updates the database records in-place."""
+        initial = [
+            {'index': 1, 'input': 'old input 1\n', 'output': 'old out 1\n', 'is_sample': False, 'description': 'old desc 1'},
+            {'index': 2, 'input': 'old input 2\n', 'output': 'old out 2\n', 'is_sample': False, 'description': 'old desc 2'},
+        ]
+        self._post_sync(initial)
+        tc1_id = ProblemTestCase.objects.get(problem=self.problem, order=1).id
+        tc2_id = ProblemTestCase.objects.get(problem=self.problem, order=2).id
+        
+        updated = [
+            {'index': 1, 'input': 'new input 1\n', 'output': 'new out 1\n', 'is_sample': True, 'description': 'new desc 1'},
+            {'index': 2, 'input': 'new input 2\n', 'output': 'new out 2\n', 'is_sample': False, 'description': 'new desc 2'},
+        ]
+        self._post_sync(updated)
+        
+        tc1_after = ProblemTestCase.objects.get(problem=self.problem, order=1)
+        tc2_after = ProblemTestCase.objects.get(problem=self.problem, order=2)
+        
+        # Record identity preserved (in-place update)
+        self.assertEqual(tc1_after.id, tc1_id)
+        self.assertEqual(tc2_after.id, tc2_id)
+        
+        # Content updated correctly
+        self.assertEqual(tc1_after.input, 'new input 1\n')
+        self.assertEqual(tc1_after.output, 'new out 1\n')
+        self.assertTrue(tc1_after.is_sample)
+        self.assertEqual(tc1_after.description, 'new desc 1')
+
+    def test_failed_api_request_does_not_delete_existing_records(self):
+        """Scenario E1: If API request fails (network error, timeout), existing records are not deleted."""
+        initial = [
+            {'index': i, 'input': f'in_{i}\n', 'output': f'out_{i}\n', 'is_sample': False}
+            for i in range(1, 6)
+        ]
+        self._post_sync(initial)
+        self.assertEqual(ProblemTestCase.objects.filter(problem=self.problem).count(), 5)
+        
+        # Trigger sync with failed API
+        response = self._post_sync(None, api_error=Exception("Network Timeout connecting to Polygon API"))
+        
+        # Must retain all 5 existing test cases
+        self.assertEqual(ProblemTestCase.objects.filter(problem=self.problem).count(), 5)
+        self.assertIn('Migration failed', response.context.get('error', ''))
+
+    def test_invalid_or_incomplete_api_response_does_not_delete_existing_records(self):
+        """Scenario E2: Invalid/incomplete API response does not delete existing database records."""
+        initial = [
+            {'index': i, 'input': f'in_{i}\n', 'output': f'out_{i}\n', 'is_sample': False}
+            for i in range(1, 6)
+        ]
+        self._post_sync(initial)
+        self.assertEqual(ProblemTestCase.objects.filter(problem=self.problem).count(), 5)
+        
+        # Incomplete response: missing 'output' key
+        incomplete = [{'index': 1, 'input': 'some input'}]
+        response = self._post_sync(incomplete)
+        
+        # Must retain all 5 records
+        self.assertEqual(ProblemTestCase.objects.filter(problem=self.problem).count(), 5)
+        self.assertIn('Incomplete test case', response.context.get('error', ''))
+
+        # Invalid response: None value for output
+        invalid_none = [{'index': 1, 'input': 'some input', 'output': None}]
+        response = self._post_sync(invalid_none)
+        self.assertEqual(ProblemTestCase.objects.filter(problem=self.problem).count(), 5)
+
+        # Invalid response: string instead of list
+        response = self._post_sync("error string")
+        self.assertEqual(ProblemTestCase.objects.filter(problem=self.problem).count(), 5)
+
+    def test_sample_and_regular_test_cases_remain_correctly_separated(self):
+        """Scenario F: SampleTestCase and ProblemTestCase remain distinct and correctly synchronized."""
+        test_cases = [
+            {'index': 1, 'input': 'sample in 1\n', 'output': 'sample out 1\n', 'is_sample': True, 'description': 'Sample 1'},
+            {'index': 2, 'input': 'sample in 2\n', 'output': 'sample out 2\n', 'is_sample': True, 'description': 'Sample 2'},
+            {'index': 3, 'input': 'regular in 1\n', 'output': 'regular out 1\n', 'is_sample': False, 'description': 'Regular 1'},
+            {'index': 4, 'input': 'regular in 2\n', 'output': 'regular out 2\n', 'is_sample': False, 'description': 'Regular 2'},
+            {'index': 5, 'input': 'regular in 3\n', 'output': 'regular out 3\n', 'is_sample': False, 'description': 'Regular 3'},
+        ]
+        self._post_sync(test_cases)
+        
+        # ProblemTestCase has all 5
+        self.assertEqual(ProblemTestCase.objects.filter(problem=self.problem).count(), 5)
+        self.assertEqual(ProblemTestCase.objects.filter(problem=self.problem, is_sample=True).count(), 2)
+        self.assertEqual(ProblemTestCase.objects.filter(problem=self.problem, is_sample=False).count(), 3)
+        
+        # SampleTestCase has exactly the 2 samples
+        self.assertEqual(SampleTestCase.objects.filter(problem=self.problem).count(), 2)
+        samples = list(SampleTestCase.objects.filter(problem=self.problem).order_by('order'))
+        self.assertEqual(samples[0].input, 'sample in 1\n')
+        self.assertEqual(samples[1].input, 'sample in 2\n')
+        
+        # Now re-migrate with 1 sample removed (now 1 sample and 2 regular = 3 total)
+        reduced = [
+            {'index': 1, 'input': 'sample in 1\n', 'output': 'sample out 1\n', 'is_sample': True, 'description': 'Sample 1'},
+            {'index': 2, 'input': 'regular in 1\n', 'output': 'regular out 1\n', 'is_sample': False, 'description': 'Regular 1'},
+            {'index': 3, 'input': 'regular in 2\n', 'output': 'regular out 2\n', 'is_sample': False, 'description': 'Regular 2'},
+        ]
+        self._post_sync(reduced)
+        
+        self.assertEqual(ProblemTestCase.objects.filter(problem=self.problem).count(), 3)
+        self.assertEqual(SampleTestCase.objects.filter(problem=self.problem).count(), 1)
+        self.assertEqual(SampleTestCase.objects.filter(problem=self.problem).first().input, 'sample in 1\n')
+
+    def test_empty_test_case_collection_behavior_handled_explicitly_and_safely(self):
+        """Scenario: Legitimate empty collection [] safely cleans records and updates count to 0 without errors."""
+        initial = [
+            {'index': 1, 'input': 'in\n', 'output': 'out\n', 'is_sample': True},
+            {'index': 2, 'input': 'in2\n', 'output': 'out2\n', 'is_sample': False},
+        ]
+        self._post_sync(initial)
+        self.assertEqual(ProblemTestCase.objects.filter(problem=self.problem).count(), 2)
+        self.assertEqual(SampleTestCase.objects.filter(problem=self.problem).count(), 1)
+        
+        # Sync with legitimate empty list []
+        response = self._post_sync([])
+        
+        self.assertEqual(ProblemTestCase.objects.filter(problem=self.problem).count(), 0)
+        self.assertEqual(SampleTestCase.objects.filter(problem=self.problem).count(), 0)
+        self.problem.refresh_from_db()
+        self.assertEqual(self.problem.test_case_count, 0)
+        self.assertIn('Test cases migrated to database successfully', response.context.get('success', ''))
+
+
