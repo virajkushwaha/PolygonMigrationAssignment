@@ -395,3 +395,129 @@ class TestCaseSynchronizationTests(TestCase):
         self.assertIn('Test cases migrated to database successfully', response.context.get('success', ''))
 
 
+class DuplicateProblemTitleTests(TestCase):
+    def setUp(self):
+        self.client = Client()
+        self.staff_user = User.objects.create_superuser(
+            email='title_tester@polygon.com',
+            password='testpassword123',
+            first_name='Title',
+            last_name='Tester',
+            username='title_tester',
+            contact_number='1234567890',
+            college='Test College',
+            graduation_year=2024,
+            gender='OTHER',
+        )
+        self.client.force_login(self.staff_user)
+
+    def _post_migrate_problem(self, polygon_id, title, difficulty='medium', tags=None):
+        with patch('problems.views.PolygonAPI') as mock_api_class:
+            mock_api = mock_api_class.return_value
+            mock_api.get_problem_info.return_value = {'name': title}
+            mock_api.download_and_extract_package.return_value = (
+                f'<html><div class="title">{title}</div>'
+                f'<div class="legend">Legend for {title}</div>'
+                f'<div class="input-specification">Input</div>'
+                f'<div class="output-specification">Output</div></html>'
+            )
+            mock_api.get_test_cases_from_redis.return_value = [
+                {'index': 1, 'input': '1\n', 'output': '2\n', 'is_sample': True}
+            ]
+            mock_api.get_all_test_cases.return_value = [
+                {'index': 1, 'input': '1\n', 'output': '2\n', 'is_sample': True}
+            ]
+            mock_api.get_test_cases.return_value = [{'index': 1}]
+            mock_api._make_request.return_value = 'ncmp'
+            mock_api.get_custom_checker_info.return_value = None
+
+            post_data = {
+                'problem_id': polygon_id,
+                'migrate_to_db': '1',
+                'difficulty': difficulty,
+            }
+            if tags:
+                post_data['tags'] = tags
+
+            response = self.client.post('/', post_data)
+            return response
+
+    def test_two_different_polygon_ids_with_same_title(self):
+        """Two different Polygon problems with identical title must both save successfully without IntegrityError."""
+        # 1. Migrate first problem: Polygon ID 1001, title "Two Sum"
+        resp1 = self._post_migrate_problem('1001', 'Two Sum')
+        self.assertEqual(resp1.status_code, 200)
+        self.assertIn('created in database successfully', resp1.context.get('db_success', ''))
+
+        # 2. Migrate second problem: Polygon ID 2002, same title "Two Sum"
+        resp2 = self._post_migrate_problem('2002', 'Two Sum')
+        self.assertEqual(resp2.status_code, 200)
+        self.assertIn('created in database successfully', resp2.context.get('db_success', ''))
+
+        # Both records must exist as separate Problem rows
+        p1 = Problem.objects.get(polygon_id='1001')
+        p2 = Problem.objects.get(polygon_id='2002')
+        self.assertNotEqual(p1.id, p2.id)
+
+        # Human-readable titles must be preserved exactly
+        self.assertEqual(p1.title, 'Two Sum')
+        self.assertEqual(p2.title, 'Two Sum')
+
+        # Slugs must be unique and deterministic
+        self.assertEqual(p1.slug, 'two-sum')
+        self.assertEqual(p2.slug, 'two-sum-2002')
+
+    def test_same_polygon_id_migrated_twice(self):
+        """Re-migrating the same Polygon ID must update the existing record instead of creating duplicates."""
+        resp1 = self._post_migrate_problem('1001', 'Two Sum', difficulty='easy')
+        p1_orig = Problem.objects.get(polygon_id='1001')
+        self.assertEqual(p1_orig.difficulty, 'easy')
+        self.assertEqual(Problem.objects.count(), 1)
+
+        # Re-migrate with updated difficulty
+        resp2 = self._post_migrate_problem('1001', 'Two Sum', difficulty='hard')
+        self.assertEqual(resp2.status_code, 200)
+        self.assertIn('updated in database successfully', resp2.context.get('db_success', ''))
+
+        # Record count remains 1
+        self.assertEqual(Problem.objects.count(), 1)
+        p1_updated = Problem.objects.get(polygon_id='1001')
+        self.assertEqual(p1_updated.id, p1_orig.id)
+        self.assertEqual(p1_updated.slug, 'two-sum')
+        self.assertEqual(p1_updated.difficulty, 'hard')
+
+    def test_unique_and_deterministic_slugs(self):
+        """Slugs must be deterministic: first gets base slug, colliding gets base_slug-{polygon_id}."""
+        self._post_migrate_problem('3001', 'Graph Traversal')
+        self._post_migrate_problem('3002', 'Graph Traversal')
+        self._post_migrate_problem('3003', 'Graph Traversal')
+
+        p1 = Problem.objects.get(polygon_id='3001')
+        p2 = Problem.objects.get(polygon_id='3002')
+        p3 = Problem.objects.get(polygon_id='3003')
+
+        self.assertEqual(p1.slug, 'graph-traversal')
+        self.assertEqual(p2.slug, 'graph-traversal-3002')
+        self.assertEqual(p3.slug, 'graph-traversal-3003')
+
+    def test_existing_problem_title_preserved(self):
+        """The original problem title must remain intact without appending polygon IDs into title."""
+        self._post_migrate_problem('5001', 'Special Characters #!& Problem')
+        p = Problem.objects.get(polygon_id='5001')
+        self.assertEqual(p.title, 'Special Characters #!& Problem')
+
+    def test_existing_records_and_relationships_remain_intact(self):
+        """Re-migrating a problem preserves attached test cases and tags."""
+        self._post_migrate_problem('6001', 'Problem With Relations', tags=['math', 'dp'])
+        p = Problem.objects.get(polygon_id='6001')
+        self.assertEqual(p.sample_test_cases.count(), 1)
+        self.assertEqual(p.extra_tags.count(), 2)
+
+        # Re-migrate
+        self._post_migrate_problem('6001', 'Problem With Relations', tags=['math', 'dp', 'greedy'])
+        p.refresh_from_db()
+        self.assertEqual(p.sample_test_cases.count(), 1)
+        self.assertEqual(p.extra_tags.count(), 3)
+
+
+

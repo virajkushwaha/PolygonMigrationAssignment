@@ -198,6 +198,51 @@ def sync_sample_test_cases(problem_obj, test_cases):
     return len(active_sample_ids), deleted_count
 
 
+def generate_unique_slug(title, polygon_id):
+    """
+    Generates a unique, deterministic slug for a Problem based on its title and polygon_id.
+    - If the problem already exists in DB with this polygon_id and its title has not changed,
+      its existing slug is preserved.
+    - If the base slug is available (not used by any other problem), it is used.
+    - If another problem already uses the base slug, appends '-{polygon_id}' deterministically.
+    - Handles length constraints and collisions safely without causing IntegrityError.
+    """
+    base_slug = slugify(title)
+    if not base_slug:
+        base_slug = f"problem-{polygon_id}"
+
+    # Check if problem already exists with this polygon_id
+    existing_problem = Problem.objects.filter(polygon_id=str(polygon_id)).first()
+    if existing_problem and existing_problem.slug:
+        # If title slug has not changed, keep current slug
+        if slugify(existing_problem.title) == base_slug:
+            return existing_problem.slug
+
+    # Ensure base_slug + polygon_id suffix fits within SlugField max_length (255)
+    suffix = f"-{polygon_id}"
+    max_base_len = 255 - len(suffix)
+    truncated_base = base_slug[:max_base_len].rstrip('-')
+    if not truncated_base:
+        truncated_base = f"p-{polygon_id}"
+
+    # 1. Try base slug if no other problem has it
+    if len(base_slug) <= 255 and not Problem.objects.filter(slug=base_slug).exclude(polygon_id=str(polygon_id)).exists():
+        return base_slug
+
+    # 2. Try deterministic slug with polygon_id suffix
+    deterministic_slug = f"{truncated_base}{suffix}"
+    if not Problem.objects.filter(slug=deterministic_slug).exclude(polygon_id=str(polygon_id)).exists():
+        return deterministic_slug
+
+    # 3. Fallback counter if collision persists
+    counter = 1
+    while True:
+        candidate = f"{deterministic_slug[:250 - len(str(counter))]}-{counter}"
+        if not Problem.objects.filter(slug=candidate).exclude(polygon_id=str(polygon_id)).exists():
+            return candidate
+        counter += 1
+
+
 @user_passes_test(lambda u: u.is_authenticated and u.is_staff, login_url='/users/login/')
 def index(request):
     """
@@ -408,7 +453,7 @@ def index(request):
                 
                 # Prepare problem data for display
                 title = html_data['title'] or info.get('name', f'Polygon Problem {polygon_id}')
-                slug = slugify(title)
+                slug = generate_unique_slug(title, polygon_id)
                 problem_statement = html_data['legend']
                 input_format = html_data['input_format']
                 output_format = html_data['output_format']
@@ -478,6 +523,7 @@ def index(request):
                     with transaction.atomic():
                         # Try to find an existing Problem by polygon_id or by ProblemTag name matching the title
                         logger.info('Starting DB migration for polygon_id=%s', polygon_id)
+                        slug = generate_unique_slug(title, polygon_id)
                         problem_obj = Problem.objects.filter(Q(polygon_id=polygon_id)).first()
                         if problem_obj:
                             logger.info('Updating existing Problem in DB')
