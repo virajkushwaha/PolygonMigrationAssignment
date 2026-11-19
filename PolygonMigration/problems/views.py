@@ -1,6 +1,14 @@
-from django.shortcuts import render
+from django.shortcuts import render, redirect
+from django.contrib import messages
 from .polygon_api import PolygonAPI
 from .models import Problem, SampleTestCase, ProblemTestCase, ProblemTag
+from .GoogleDriveStorage import (
+    create_oauth_flow,
+    get_authorization_url,
+    exchange_code_for_credentials,
+    is_authorized,
+    GoogleDriveStorageError,
+)
 from django.utils.text import slugify
 from django.db.models import Q
 from bs4 import BeautifulSoup
@@ -279,9 +287,14 @@ def index(request):
         context['selected_tags'] = []
     context['selected_tags_json'] = json.dumps(context['selected_tags'])
     
+    storage_provider = getattr(settings, 'STORAGE_PROVIDER', 'gdrive').lower()
+    context['storage_provider'] = storage_provider
+    if storage_provider == 'gdrive':
+        context['is_gdrive_authorized'] = is_authorized()
+
     if request.method == 'POST':
         polygon_id = request.POST.get('problem_id')
-        migrate_to_azure = request.POST.get('migrate_to_azure')
+        migrate_to_azure = request.POST.get('migrate_to_azure') or request.POST.get('migrate_to_storage') or request.POST.get('migrate_to_gdrive')
         migrate_to_db = request.POST.get('migrate_to_db')
         migrate_test_cases_to_db = request.POST.get('migrate_test_cases_to_db')
         difficulty = request.POST.get('difficulty', '')
@@ -342,63 +355,68 @@ def index(request):
                     context['main_solution'] = main_solution
             
             try:
-                # Handle Azure migration
+                # Handle Cloud Storage migration (Google Drive or Azure Blob Storage)
                 azure_blob_uploaded = False
                 azure_blob_problem_id = None
+                storage_provider = getattr(settings, 'STORAGE_PROVIDER', 'gdrive').lower()
+                provider_display_name = 'Google Drive' if storage_provider == 'gdrive' else 'Azure'
+
                 if migrate_to_azure:
-                    logger.info('Azure migration triggered for polygon_id=%s', polygon_id)
+                    logger.info('%s migration triggered for polygon_id=%s', provider_display_name, polygon_id)
                     problem_obj = Problem.objects.filter(polygon_id=polygon_id).first()
                     if not problem_obj:
                         logger.warning('Problem with Polygon ID %s not in DB', polygon_id)
-                        context['error'] = f"Problem with Polygon ID {polygon_id} has not been migrated to the database yet. Please migrate the problem to the database first before migrating test cases to Azure."
+                        context['error'] = f"Problem with Polygon ID {polygon_id} has not been migrated to the database yet. Please migrate the problem to the database first before migrating test cases to {provider_display_name}."
                         return render(request, 'problems/index.html', context)
                     
-                    # Problem exists in database, proceed with Azure migration
-                    logger.info('Problem found in DB, proceeding with Azure migration')
-                    AZURE_STORAGE_ACCOUNT_URL = settings.AZURE_STORAGE_ACCOUNT_URL
-                    AZURE_TENANT_ID = settings.AZURE_TENANT_ID
-                    AZURE_CLIENT_ID = settings.AZURE_CLIENT_ID
-                    AZURE_USERNAME = settings.AZURE_USERNAME
-                    AZURE_PASSWORD = settings.AZURE_PASSWORD
-                    AZURE_CONTAINER_NAME = settings.AZURE_CONTAINER_NAME
-                    
-                    # Use the database problem ID for Azure blob naming
+                    # Problem exists in database, proceed with migration
+                    logger.info('Problem found in DB, proceeding with %s migration', provider_display_name)
                     problem_id = problem_obj.id if problem_obj else None
-                    logger.info('Azure migration params: problem_id=%s, container=%s', problem_id, AZURE_CONTAINER_NAME)
+                    logger.info('%s migration params: problem_id=%s, provider=%s', provider_display_name, problem_id, storage_provider)
                     
-                    # Remove Redis cache for this problem id before Azure migration
+                    # Remove Redis cache for this problem id before migration
                     if problem_obj:
                         api.delete_problem_test_case_cache(problem_id)
                     
                     # Check for custom checker before migration
                     custom_checker_info = api.get_custom_checker_info(polygon_id)
                     if custom_checker_info:
-                        logger.info('Custom checker detected before Azure migration: %s', custom_checker_info)
-                        context['info'] = f"Custom checker '{custom_checker_info['name']}' detected. Will be compiled and uploaded to Azure."
+                        logger.info('Custom checker detected before %s migration: %s', provider_display_name, custom_checker_info)
+                        context['info'] = f"Custom checker '{custom_checker_info['name']}' detected. Will be compiled and uploaded to {provider_display_name}."
                     
-                    logger.info('Calling migrate_to_azure_blob')
                     try:
-                        api.migrate_to_azure_blob(
-                            polygon_id,
-                            AZURE_STORAGE_ACCOUNT_URL,
-                            AZURE_TENANT_ID,
-                            AZURE_CLIENT_ID,
-                            AZURE_USERNAME,
-                            AZURE_PASSWORD,
-                            AZURE_CONTAINER_NAME,
-                            problem_id
-                        )
+                        if storage_provider == 'gdrive':
+                            logger.info('Calling migrate_to_google_drive')
+                            api.migrate_to_google_drive(
+                                polygon_id,
+                                settings.GOOGLE_DRIVE_CREDENTIALS_FILE,
+                                settings.GOOGLE_DRIVE_FOLDER_ID,
+                                problem_id
+                            )
+                        elif storage_provider == 'azure':
+                            logger.info('Calling migrate_to_azure_blob')
+                            api.migrate_to_azure_blob(
+                                polygon_id,
+                                settings.AZURE_STORAGE_ACCOUNT_URL,
+                                settings.AZURE_TENANT_ID,
+                                settings.AZURE_CLIENT_ID,
+                                settings.AZURE_USERNAME,
+                                settings.AZURE_PASSWORD,
+                                settings.AZURE_CONTAINER_NAME,
+                                problem_id
+                            )
+                        else:
+                            raise ValueError(f"Unsupported STORAGE_PROVIDER: '{storage_provider}'. Supported options: 'gdrive', 'azure'.")
+                        
                         azure_blob_uploaded = True
                         azure_blob_problem_id = problem_id
                     except Exception as e:
-                        logger.error('Azure migration failed: %s', e, exc_info=True)
-                        # Compensate: attempt to delete any uploaded blobs if possible (pseudo-code, implement as needed)
-                        # api.delete_azure_blob(problem_id)
-                        context['error'] = f"Azure migration failed: {str(e)}"
+                        logger.error('%s migration failed: %s', provider_display_name, e, exc_info=True)
+                        context['error'] = f"{provider_display_name} migration failed: {str(e)}"
                         raise
-                    logger.info('Azure migration completed successfully')
                     
-                    success_message = "Test cases migrated to Azure Blob Storage successfully."
+                    logger.info('%s migration completed successfully', provider_display_name)
+                    success_message = f"Test cases migrated to {provider_display_name} successfully."
                     if custom_checker_info:
                         success_message += f" Custom checker '{custom_checker_info['name']}' was also compiled and uploaded."
                     context['success'] = success_message
@@ -680,7 +698,8 @@ def index(request):
 
             except Exception as e:
                 logger.error('Exception in index view: %s', e, exc_info=True)
-                context['error'] = f"Migration failed and all changes have been rolled back. Reason: {str(e)}"
+                if not context.get('error'):
+                    context['error'] = f"Migration failed and all changes have been rolled back. Reason: {str(e)}"
                 # Compensate for Azure: attempt to delete any uploaded blobs if azure_blob_uploaded is True (pseudo-code)
                 if azure_blob_uploaded and azure_blob_problem_id and hasattr(api, 'delete_azure_blob'):
                     api.delete_azure_blob(azure_blob_problem_id)
@@ -696,4 +715,94 @@ def index(request):
 
     logger.info('Exiting index view')
     return render(request, 'problems/index.html', context)
+
+
+def google_drive_authorize(request):
+    """
+    Initiates Google OAuth 2.0 authorization for Google Drive access.
+    Redirects the user to Google's consent screen.
+    """
+    try:
+        redirect_uri = request.build_absolute_uri('/oauth2callback/')
+        if '?' in redirect_uri:
+            redirect_uri = redirect_uri.split('?')[0]
+
+        flow = create_oauth_flow(redirect_uri=redirect_uri)
+        auth_url, state = flow.authorization_url(
+            access_type='offline',
+            include_granted_scopes='true',
+            prompt='consent'
+        )
+        request.session['google_drive_oauth_state'] = state
+        request.session['google_drive_oauth_code_verifier'] = flow.code_verifier
+        request.session.modified = True
+        logger.info("Redirecting user to Google OAuth authorization URL.")
+        return redirect(auth_url)
+    except Exception as e:
+        logger.error(f"Error initiating Google Drive OAuth authorization: {e}", exc_info=True)
+        messages.error(request, f"Failed to initiate Google OAuth: {str(e)}")
+        return redirect('problems:index')
+
+
+def google_drive_oauth2callback(request):
+    """
+    Handles Google's OAuth 2.0 authorization callback at /oauth2callback/.
+    Exchanges the authorization code for credentials and persists the refresh token.
+    """
+    error = request.GET.get('error')
+    if error:
+        logger.warning(f"Google OAuth authorization denied or returned error: {error}")
+        messages.error(request, f"Google Drive authorization was denied or failed: {error}")
+        return redirect('problems:index')
+
+    code = request.GET.get('code')
+    state = request.GET.get('state')
+
+    if not code:
+        logger.error("OAuth callback received without authorization code.")
+        messages.error(request, "Google Drive authorization failed: Missing authorization code. Please restart authorization.")
+        return redirect('problems:index')
+
+    session_state = request.session.get('google_drive_oauth_state')
+    if session_state and state and session_state != state:
+        logger.error("OAuth state mismatch in callback (potential CSRF).")
+        messages.error(request, "Google Drive authorization failed: State parameter mismatch. Please restart authorization.")
+        return redirect('problems:index')
+
+    code_verifier = request.session.get('google_drive_oauth_code_verifier')
+    if not code_verifier:
+        logger.error("OAuth callback received without PKCE code verifier in session.")
+        messages.error(
+            request,
+            "Google Drive authorization failed: Missing or expired session verifier. "
+            "Please restart authorization."
+        )
+        return redirect('problems:index')
+
+    try:
+        redirect_uri = request.build_absolute_uri('/oauth2callback/')
+        if '?' in redirect_uri:
+            redirect_uri = redirect_uri.split('?')[0]
+
+        exchange_code_for_credentials(
+            authorization_response=request.build_absolute_uri(),
+            code=code,
+            code_verifier=code_verifier,
+            state=state,
+            redirect_uri=redirect_uri
+        )
+
+        # Remove the session verifier and state after successful exchange
+        request.session.pop('google_drive_oauth_code_verifier', None)
+        request.session.pop('google_drive_oauth_state', None)
+        request.session.modified = True
+
+        logger.info("Google Drive OAuth authorization completed and credentials persisted.")
+        messages.success(request, "Google Drive authorized successfully! Your account is connected and ready for migration.")
+        return redirect('problems:index')
+    except Exception as e:
+        logger.error(f"Failed to complete Google Drive OAuth callback: {e}", exc_info=True)
+        messages.error(request, f"Failed to complete Google Drive authorization: {str(e)}")
+        return redirect('problems:index')
+
 

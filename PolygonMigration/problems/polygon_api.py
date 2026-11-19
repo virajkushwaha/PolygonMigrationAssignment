@@ -807,6 +807,152 @@ class PolygonAPI:
         logger.info("Completed custom checker processing for problem %s", problem_id)
         logger.info("Completed migrate_to_azure_blob for problem %s", problem_id)
 
+    def upload_custom_checker_to_gdrive(self, problem_id, drive_manager, db_problem_id=None):
+        """
+        Fetches, compiles, and uploads custom checker to Google Drive.
+        
+        Args:
+            problem_id (str): The Polygon problem ID.
+            drive_manager (GoogleDriveManager): Instance of GoogleDriveManager.
+            db_problem_id (str, optional): The database problem ID for naming. Defaults to None.
+        """
+        logger.info("Processing custom checker for problem %s (Google Drive)", problem_id)
+        
+        checker_info = self.get_custom_checker_info(problem_id)
+        if not checker_info:
+            logger.info("No custom checker found for problem %s", problem_id)
+            return
+        
+        source_code = self.fetch_custom_checker_file(problem_id, checker_info['name'])
+        if not source_code:
+            logger.error("Failed to fetch custom checker source code")
+            return
+        
+        problem_id_for_naming = db_problem_id if db_problem_id is not None else problem_id
+        checker_dir = settings.CUSTOM_CHECKER_DIR
+
+        def _compile_and_upload(work_dir):
+            binary_path = self.compile_custom_checker(source_code, work_dir)
+            if not binary_path:
+                logger.warning("Failed to compile custom checker, uploading source code instead")
+                drive_manager.upload_file(problem_id_for_naming, 'custom_checker.cpp', source_code, mimetype='text/plain')
+                return
+            
+            with open(binary_path, 'rb') as f:
+                binary_data = f.read()
+            
+            blob_filename = 'custom_checker.exe' if sys.platform.startswith('win') else 'custom_checker'
+            drive_manager.upload_file(problem_id_for_naming, blob_filename, binary_data, mimetype='application/octet-stream')
+
+        if checker_dir:
+            if not os.path.exists(checker_dir):
+                os.makedirs(checker_dir, exist_ok=True)
+            _compile_and_upload(checker_dir)
+        else:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                _compile_and_upload(temp_dir)
+
+    def migrate_to_google_drive(self, problem_id, credentials_file, root_folder_id, db_problem_id=None, testset='tests', drive_manager=None):
+        """
+        Fetches all test cases from Redis (or Polygon as fallback) and uploads them to Google Drive using GoogleDriveManager.
+        Each test case's input and output are uploaded as separate files:
+          - input: test_cases/{problem_id}/{test_number:02d}
+          - output: test_cases/{problem_id}/{test_number:02d}.a
+        Also handles custom checker compilation and upload if present.
+
+        Args:
+            problem_id (str): The Polygon problem ID.
+            credentials_file (str): Path to service account credentials JSON.
+            root_folder_id (str): Root Google Drive folder ID.
+            db_problem_id (str, optional): The database problem ID for naming. Defaults to None.
+            testset (str, optional): The testset name. Defaults to 'tests'.
+            drive_manager (GoogleDriveManager, optional): Pre-instantiated manager (useful in tests).
+
+        Returns:
+            int: Number of uploaded test cases.
+        """
+        sys.path.append('.')
+        from problems.GoogleDriveStorage import GoogleDriveManager
+
+        logger.info("Starting migrate_to_google_drive for problem %s", problem_id)
+
+        # Try to get test cases from Redis first
+        test_cases = self.get_test_cases_from_redis(problem_id)
+        if test_cases is None:
+            logger.warning('Test cases not found in Redis, fetching from Polygon')
+            test_cases = self.get_all_test_cases(problem_id, testset)
+            if test_cases is not None:
+                self.store_test_cases_in_redis(problem_id, test_cases, expiry_hours=0.5)
+        else:
+            logger.info('Retrieved test cases from Redis for Google Drive migration (saved Polygon API call)')
+
+        if test_cases is None:
+            raise ValueError(f"Failed to fetch test cases for problem {problem_id} from Polygon.")
+
+        logger.info("Retrieved %d test cases for Google Drive migration", len(test_cases))
+
+        if drive_manager is None:
+            drive_manager = GoogleDriveManager(
+                credentials_file=credentials_file,
+                root_folder_id=root_folder_id
+            )
+
+        problem_id_for_naming = db_problem_id if db_problem_id is not None else problem_id
+        logger.info("Using problem_id_for_naming: %s", problem_id_for_naming)
+
+        # Delete existing test cases before uploading new ones
+        logger.info("Deleting existing test cases from Google Drive")
+        drive_manager.empty_problem_files(problem_id_for_naming)
+
+        uploaded_count = 0
+        for idx, test in enumerate(test_cases, start=1):
+            input_data = test.get('input')
+            output_data = test.get('output')
+            if input_data is not None and output_data is not None:
+                drive_manager.upload_test_case(problem_id_for_naming, idx, input_data, output_data)
+                uploaded_count += 1
+            else:
+                logger.warning(f"Skipping test case #{idx}: missing input or output.")
+
+        logger.info("Uploaded %d test cases to Google Drive", uploaded_count)
+
+        # Handle custom checker if present
+        logger.info("Starting custom checker processing for problem %s", problem_id)
+        self.upload_custom_checker_to_gdrive(problem_id, drive_manager, db_problem_id)
+        logger.info("Completed custom checker processing for problem %s", problem_id)
+        logger.info("Completed migrate_to_google_drive for problem %s", problem_id)
+        return uploaded_count
+
+    def migrate_to_cloud_storage(self, problem_id, db_problem_id=None, testset='tests', drive_manager=None, blob_manager=None):
+        """
+        Migrates test cases to the configured cloud storage provider (Google Drive or Azure).
+        """
+        provider = getattr(settings, 'STORAGE_PROVIDER', 'gdrive').lower()
+        if provider == 'gdrive':
+            return self.migrate_to_google_drive(
+                problem_id=problem_id,
+                credentials_file=settings.GOOGLE_DRIVE_CREDENTIALS_FILE,
+                root_folder_id=settings.GOOGLE_DRIVE_FOLDER_ID,
+                db_problem_id=db_problem_id,
+                testset=testset,
+                drive_manager=drive_manager
+            )
+        elif provider == 'azure':
+            return self.migrate_to_azure_blob(
+                problem_id=problem_id,
+                azure_account_url=settings.AZURE_STORAGE_ACCOUNT_URL,
+                azure_tenant_id=settings.AZURE_TENANT_ID,
+                azure_client_id=settings.AZURE_CLIENT_ID,
+                azure_username=settings.AZURE_USERNAME,
+                azure_password=settings.AZURE_PASSWORD,
+                container_name=settings.AZURE_CONTAINER_NAME,
+                db_problem_id=db_problem_id,
+                testset=testset
+            )
+        else:
+            raise ValueError(f"Unsupported STORAGE_PROVIDER: '{provider}'. Supported providers: 'gdrive', 'azure'.")
+
+
     def delete_problem_test_case_cache(self, db_problem_id):
         """
         Deletes all Redis cache keys related to test cases for a given database problem ID.

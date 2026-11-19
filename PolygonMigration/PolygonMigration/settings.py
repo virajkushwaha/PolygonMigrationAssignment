@@ -16,7 +16,7 @@ from dotenv import load_dotenv
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
-load_dotenv(os.path.join(BASE_DIR, '.env'))
+load_dotenv(os.path.join(BASE_DIR, '.env'), override=True)
 
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/5.2/howto/deployment/checklist/
@@ -126,6 +126,13 @@ POLYGON_API_SECRET = os.getenv("POLYGON_API_SECRET")
 
 if not POLYGON_API_KEY or not POLYGON_API_SECRET:
     raise Exception("POLYGON_API_KEY and POLYGON_API_SECRET must be set in the .env file")
+
+STORAGE_PROVIDER = os.getenv("STORAGE_PROVIDER", "gdrive").lower()
+GOOGLE_DRIVE_OAUTH_CLIENT_FILE = os.getenv("GOOGLE_DRIVE_OAUTH_CLIENT_FILE") or os.getenv("GOOGLE_DRIVE_CREDENTIALS_FILE")
+GOOGLE_DRIVE_CREDENTIALS_FILE = GOOGLE_DRIVE_OAUTH_CLIENT_FILE
+GOOGLE_DRIVE_TOKEN_FILE = os.getenv("GOOGLE_DRIVE_TOKEN_FILE", os.path.join(BASE_DIR, "google_drive_token.json"))
+GOOGLE_DRIVE_REDIRECT_URI = os.getenv("GOOGLE_DRIVE_REDIRECT_URI", "http://localhost:8000/oauth2callback/")
+GOOGLE_DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID")
 
 AZURE_STORAGE_ACCOUNT_URL = os.getenv("AZURE_STORAGE_ACCOUNT_URL")
 AZURE_TENANT_ID = os.getenv("AZURE_TENANT_ID")

@@ -130,6 +130,23 @@
             </div>
         </form>
 
+        {% if messages %}
+            {% for message in messages %}
+                <div class="alert alert-{% if message.tags == 'error' %}danger{% else %}{{ message.tags }}{% endif %} mt-4">
+                    <p>{{ message }}</p>
+                </div>
+            {% endfor %}
+        {% endif %}
+
+        {% if storage_provider == 'gdrive' and not is_gdrive_authorized %}
+            <div class="alert alert-warning mt-4 d-flex justify-content-between align-items-center">
+                <div>
+                    <strong>Google Drive Connection:</strong> Google Drive is not authorized yet. Please connect your Google account to enable test case migration.
+                </div>
+                <a href="{% url 'problems:google_drive_authorize' %}" class="btn btn-warning btn-sm ms-3">Authorize Google Drive</a>
+            </div>
+        {% endif %}
+
         {% if error %}
             <div class="alert alert-danger mt-4">
                 <h4>Error</h4>
@@ -251,7 +268,7 @@
                         {% csrf_token %}
                         <input type="hidden" name="problem_id" value="{{ problem_id }}">
                         <input type="hidden" name="migrate_to_azure" value="1">
-                        <button class="btn btn-success {% if not db_problem %}disabled{% endif %}" type="submit" {% if not db_problem %}disabled data-bs-toggle="tooltip" data-bs-placement="top" title="Please migrate the problem to the database first."{% endif %}>Migrate Test Cases to Azure</button>
+                        <button class="btn btn-success {% if not db_problem %}disabled{% endif %}" type="submit" {% if not db_problem %}disabled data-bs-toggle="tooltip" data-bs-placement="top" title="Please migrate the problem to the database first."{% endif %}>Migrate Test Cases to {% if storage_provider == 'gdrive' %}Google Drive{% else %}Azure{% endif %}</button>
                     </form>
                 </div>
                 
@@ -425,11 +442,11 @@
             });
         }
         
-        // Handle migrate to Azure form
+        // Handle migrate to Cloud Storage form
         var azureForm = document.getElementById('migrate-azure-form');
         if (azureForm) {
             azureForm.addEventListener('submit', function() {
-                showLoading('Migrating to Azure...');
+                showLoading('Migrating to {% if storage_provider == "gdrive" %}Google Drive{% else %}Azure{% endif %}...');
             });
         }
         
